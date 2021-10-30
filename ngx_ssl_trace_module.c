@@ -80,10 +80,33 @@ ngx_ssl_trace_create_conf(ngx_cycle_t *cycle)
 }
 
 
+BIO *bio_err = NULL;
+
+# define B_FORMAT_TEXT   0x8000
+# define FORMAT_TEXT    (1 | B_FORMAT_TEXT)     /* Generic text */
+
+int FMT_istext(int format)
+{
+    return (format & B_FORMAT_TEXT) == B_FORMAT_TEXT;
+}
+
+BIO *dup_bio_err(int format)
+{
+    BIO *b = BIO_new_fp(stderr,
+                        BIO_NOCLOSE | (FMT_istext(format) ? BIO_FP_TEXT : 0));
+#ifdef OPENSSL_SYS_VMS
+    if (FMT_istext(format))
+        b = BIO_push(BIO_new(BIO_f_linebuffer()), b);
+#endif
+    return b;
+}
+
 static char *
 ngx_ssl_trace_init_conf(ngx_cycle_t *cycle, void *conf)
 {
     ngx_ssl_trace_conf_t *stcf = conf;
+
+    bio_err = dup_bio_err(FORMAT_TEXT);
 
     stcf->categories.len = 0;
     stcf->categories.data = NULL;
@@ -107,25 +130,6 @@ ngx_ssl_trace_categories(ngx_conf_t *cf, void *post, void *data)
     return NGX_CONF_OK;
 }
 
-
-# define B_FORMAT_TEXT   0x8000
-# define FORMAT_TEXT    (1 | B_FORMAT_TEXT)     /* Generic text */
-
-int FMT_istext(int format)
-{
-    return (format & B_FORMAT_TEXT) == B_FORMAT_TEXT;
-}
-
-BIO *dup_bio_err(int format)
-{
-    BIO *b = BIO_new_fp(stderr,
-                        BIO_NOCLOSE | (FMT_istext(format) ? BIO_FP_TEXT : 0));
-#ifdef OPENSSL_SYS_VMS
-    if (FMT_istext(format))
-        b = BIO_push(BIO_new(BIO_f_linebuffer()), b);
-#endif
-    return b;
-}
 
 typedef struct tracedata_st {
     BIO *bio;
@@ -158,22 +162,37 @@ static size_t internal_trace_cb(const char *buf, size_t cnt,
 
     switch (cmd) {
     case OSSL_TRACE_CTRL_BEGIN:
+        if (trace_data->ingroup) {
+            BIO_printf(bio_err, "ERROR: tracing already started\n");
+            return 0;
+        }
         trace_data->ingroup = 1;
 
         tid = CRYPTO_THREAD_get_current_id();
         hex = OPENSSL_buf2hexstr((const unsigned char *)&tid, sizeof(tid));
         BIO_snprintf(buffer, sizeof(buffer), "TRACE[%s]:%s: ",
-                     hex, OSSL_trace_get_category_name(category));
+                     hex == NULL ? "<null>" : hex,
+                     OSSL_trace_get_category_name(category));
         OPENSSL_free(hex);
         BIO_set_prefix(trace_data->bio, buffer);
         break;
     case OSSL_TRACE_CTRL_WRITE:
+        if (!trace_data->ingroup) {
+            BIO_printf(bio_err, "ERROR: writing when tracing not started\n");
+            return 0;
+        }
+
         ret = BIO_write(trace_data->bio, buf, cnt);
         break;
     case OSSL_TRACE_CTRL_END:
+        if (!trace_data->ingroup) {
+            BIO_printf(bio_err, "ERROR: finishing when tracing not started\n");
+            return 0;
+        }
         trace_data->ingroup = 0;
 
         BIO_set_prefix(trace_data->bio, NULL);
+
         break;
     }
 
@@ -184,14 +203,17 @@ static void setup_trace_category(int category)
 {
     BIO *channel;
     tracedata *trace_data;
+    BIO *bio = NULL;
 
     if (OSSL_trace_enabled(category))
         return;
 
-    channel = BIO_push(BIO_new(BIO_f_prefix()), dup_bio_err(FORMAT_TEXT));
+    bio = BIO_new(BIO_f_prefix());
+    channel = BIO_push(bio, dup_bio_err(FORMAT_TEXT));
     trace_data = OPENSSL_zalloc(sizeof(*trace_data));
 
     if (trace_data == NULL
+        || bio == NULL
         || (trace_data->bio = channel) == NULL
         || OSSL_trace_set_callback(category, internal_trace_cb,
                                    trace_data) == 0
